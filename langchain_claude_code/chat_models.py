@@ -12,7 +12,9 @@ This is why inference goes through the CLI subprocess.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Iterator, List, Optional
+import base64
+from pathlib import Path
+from typing import Any, AsyncIterator, Iterator, List, Optional, Union
 
 from langchain_core.callbacks import (
     CallbackManagerForLLMRun,
@@ -28,24 +30,114 @@ from langchain_core.messages import (
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
 
+def _content_to_anthropic_blocks(content: Union[str, list]) -> Union[str, list[dict]]:
+    """Convert LangChain message content to Anthropic content blocks.
+
+    Handles:
+      - Plain strings → returned as-is
+      - List of dicts with type "text" → text blocks
+      - List of dicts with type "image_url" → image blocks (base64 or URL)
+    """
+    if isinstance(content, str):
+        return content
+
+    if not isinstance(content, list):
+        return str(content)
+
+    blocks: list[dict] = []
+    for item in content:
+        if isinstance(item, str):
+            blocks.append({"type": "text", "text": item})
+        elif isinstance(item, dict):
+            item_type = item.get("type", "")
+
+            if item_type == "text":
+                blocks.append({"type": "text", "text": item.get("text", "")})
+
+            elif item_type == "image_url":
+                image_url = item.get("image_url", {})
+                if isinstance(image_url, str):
+                    url = image_url
+                else:
+                    url = image_url.get("url", "")
+
+                if url.startswith("data:"):
+                    # data:image/png;base64,iVBOR...
+                    header, b64data = url.split(",", 1)
+                    media_type = header.split(":")[1].split(";")[0]
+                    blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": b64data,
+                        },
+                    })
+                else:
+                    # Regular URL
+                    blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": url,
+                        },
+                    })
+
+            elif item_type == "image":
+                # Direct Anthropic-style image block (passthrough)
+                blocks.append(item)
+            else:
+                blocks.append({"type": "text", "text": str(item)})
+        else:
+            blocks.append({"type": "text", "text": str(item)})
+
+    return blocks
+
+
 def _convert_messages(
     messages: List[BaseMessage],
-) -> tuple[Optional[str], list[dict]]:
-    """Convert LangChain messages → Anthropic API format (system, messages)."""
+) -> tuple[Optional[str], list[dict], bool]:
+    """Convert LangChain messages → Anthropic API format.
+
+    Returns (system, messages, has_multimodal).
+    """
     system: Optional[str] = None
     api_msgs: list[dict] = []
+    has_multimodal = False
 
     for msg in messages:
         if isinstance(msg, SystemMessage):
             system = str(msg.content)
         elif isinstance(msg, HumanMessage):
-            api_msgs.append({"role": "user", "content": str(msg.content)})
+            content = _content_to_anthropic_blocks(msg.content)
+            if isinstance(content, list):
+                has_multimodal = True
+            api_msgs.append({"role": "user", "content": content})
         elif isinstance(msg, AIMessage):
             api_msgs.append({"role": "assistant", "content": str(msg.content)})
         else:
             api_msgs.append({"role": "user", "content": str(msg.content)})
 
-    return system, api_msgs
+    return system, api_msgs, has_multimodal
+
+
+def _build_prompt_string(api_messages: list[dict]) -> str:
+    """Build a plain text prompt from messages (text-only fallback)."""
+    if len(api_messages) == 1:
+        content = api_messages[0]["content"]
+        return content if isinstance(content, str) else str(content)
+
+    parts = []
+    for msg in api_messages:
+        role = msg["role"].capitalize()
+        content = msg["content"]
+        if isinstance(content, str):
+            parts.append(f"{role}: {content}")
+        else:
+            # Extract text from blocks
+            texts = [b["text"] for b in content if b.get("type") == "text"]
+            parts.append(f"{role}: {' '.join(texts)}")
+    return "\n\n".join(parts)
 
 
 class ChatClaudeCode(BaseChatModel):
@@ -56,32 +148,41 @@ class ChatClaudeCode(BaseChatModel):
     (OAuth tokens stored in the system keychain).
 
     Requirements:
-      - ``claude`` CLI installed and authenticated (``npm install -g @anthropic-ai/claude-code``)
-      - ``claude-code-sdk`` Python package (``pip install claude-code-sdk``)
+      - ``claude`` CLI installed and authenticated
+      - ``claude-code-sdk`` Python package
+
+    Supports multimodal input (images) via LangChain's standard format:
 
     Examples:
         .. code-block:: python
 
             from langchain_claude_code import ChatClaudeCode
+            from langchain_core.messages import HumanMessage
 
             llm = ChatClaudeCode(model="claude-sonnet-4-20250514")
-            llm.invoke("Hello, Claude!")
 
-            # With system message
-            from langchain_core.messages import HumanMessage, SystemMessage
-            llm.invoke([
-                SystemMessage(content="You are helpful."),
-                HumanMessage(content="What is OAuth2?"),
-            ])
+            # Text only
+            llm.invoke("Hello!")
 
-            # With chains
-            from langchain_core.prompts import ChatPromptTemplate
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", "You are helpful."),
-                ("human", "{input}"),
-            ])
-            chain = prompt | llm
-            chain.invoke({"input": "Explain OAuth2 briefly"})
+            # With image (base64)
+            import base64
+            with open("image.png", "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+
+            llm.invoke([HumanMessage(content=[
+                {"type": "text", "text": "What's in this image?"},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/png;base64,{b64}"
+                }},
+            ])])
+
+            # With image URL
+            llm.invoke([HumanMessage(content=[
+                {"type": "text", "text": "Describe this image"},
+                {"type": "image_url", "image_url": {
+                    "url": "https://example.com/photo.jpg"
+                }},
+            ])])
     """
 
     model: str = "claude-sonnet-4-20250514"
@@ -135,17 +236,7 @@ class ChatClaudeCode(BaseChatModel):
                 "claude-code-sdk is required. Install with: pip install claude-code-sdk"
             )
 
-        system, api_messages = _convert_messages(messages)
-
-        # Build prompt from messages
-        if len(api_messages) == 1:
-            prompt = api_messages[0]["content"]
-        else:
-            parts = []
-            for msg in api_messages:
-                role = msg["role"].capitalize()
-                parts.append(f"{role}: {msg['content']}")
-            prompt = "\n\n".join(parts)
+        system, api_messages, has_multimodal = _convert_messages(messages)
 
         options = ClaudeCodeOptions(
             model=self.model,
@@ -156,28 +247,39 @@ class ChatClaudeCode(BaseChatModel):
         if self.permission_mode:
             options.permission_mode = self.permission_mode  # type: ignore
 
-        # Run async query synchronously
         text_parts: list[str] = []
 
-        async def _run() -> None:
-            async for msg in claude_query(prompt=prompt, options=options):
-                if hasattr(msg, "content"):
-                    for block in msg.content:
-                        if hasattr(block, "text"):
-                            text_parts.append(block.text)
+        if has_multimodal:
+            # Use streaming mode to send multimodal content
+            async def _run_multimodal() -> None:
+                async def _input_stream() -> AsyncIterator[dict[str, Any]]:
+                    for msg in api_messages:
+                        yield {
+                            "type": "user",
+                            "message": {"role": msg["role"], "content": msg["content"]},
+                        }
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+                async for resp in claude_query(
+                    prompt=_input_stream(), options=options
+                ):
+                    if hasattr(resp, "content"):
+                        for block in resp.content:
+                            if hasattr(block, "text"):
+                                text_parts.append(block.text)
 
-        if loop and loop.is_running():
-            import concurrent.futures
-
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                pool.submit(lambda: asyncio.run(_run())).result()
+            self._run_async(_run_multimodal())
         else:
-            asyncio.run(_run())
+            # Simple string prompt for text-only
+            prompt = _build_prompt_string(api_messages)
+
+            async def _run_text() -> None:
+                async for msg in claude_query(prompt=prompt, options=options):
+                    if hasattr(msg, "content"):
+                        for block in msg.content:
+                            if hasattr(block, "text"):
+                                text_parts.append(block.text)
+
+            self._run_async(_run_text())
 
         text = "".join(text_parts)
 
@@ -189,6 +291,21 @@ class ChatClaudeCode(BaseChatModel):
                 )
             ]
         )
+
+    @staticmethod
+    def _run_async(coro: Any) -> None:
+        """Run an async coroutine synchronously."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                pool.submit(lambda: asyncio.run(coro)).result()
+        else:
+            asyncio.run(coro)
 
     def _stream(
         self,
