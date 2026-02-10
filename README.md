@@ -50,7 +50,36 @@ print(response.content)
 - **Claude Code CLI** installed and authenticated: `npm install -g @anthropic-ai/claude-code`
 - **Claude Pro or Max subscription**
 - **Python 3.10+**
+- **Node.js 18+** (required by Claude Code CLI)
 - CLI must run in a **TTY** (terminal) — doesn't work when backgrounded
+
+### Platform Support
+
+| Platform | Status | Credential Storage |
+|---|---|---|
+| **macOS** | ✅ Fully supported | macOS Keychain |
+| **Linux** | ✅ Fully supported | `~/.claude/credentials.json` |
+| **Windows (WSL)** | ✅ Works in WSL | `~/.claude/credentials.json` |
+| **Windows (native)** | ⚠️ Untested | — |
+
+#### Linux Setup
+
+```bash
+# 1. Install Node.js 18+ (if not installed)
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+# 2. Install Claude Code CLI
+npm install -g @anthropic-ai/claude-code
+
+# 3. Authenticate (opens browser for OAuth)
+claude auth login
+
+# 4. Install the package
+pip install langchain-claude-code
+```
+
+> **Note:** On headless Linux servers, `claude auth login` will print a URL to open in your browser. Complete the OAuth flow there, and the CLI will store credentials locally.
 
 ## Usage
 
@@ -228,7 +257,7 @@ See [`examples/agent.py`](examples/agent.py) for a full working example.
 
 ## How It Works
 
-Claude Code CLI stores OAuth tokens in the system keychain with scopes like `user:inference`. These tokens are **restricted to the Claude Code CLI** — they return:
+Claude Code CLI stores OAuth tokens in the system credential store (macOS Keychain, or `~/.claude/credentials.json` on Linux). These tokens are **restricted to the Claude Code CLI** — they return:
 
 > *"This credential is only authorized for use with Claude Code and cannot be used for other API requests."*
 
