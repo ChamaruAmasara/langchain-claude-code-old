@@ -44,6 +44,10 @@ print(response.content)
 | API key auth | ✅ | N/A | Uses subscription via CLI OAuth |
 | Strict tool use | ✅ | ❌ | |
 | MCP servers | ❌ | ✅ | Via Claude Code's MCP support |
+| Agentic mode | ❌ | ✅ | Built-in filesystem, bash, etc. |
+| Tool access control | N/A | ✅ | `allowed_tools` / `disallowed_tools` |
+| Computer use | ✅ | ❌ | API-only feature |
+| Web search | ✅ | ❌ | API-only feature |
 
 ## Prerequisites
 
@@ -200,6 +204,67 @@ llm = ChatClaudeCode(model="claude-sonnet-4-20250514", effort="low")
 llm = ChatClaudeCode(model="claude-sonnet-4-20250514", effort="high")
 ```
 
+### Agentic Mode (Filesystem, Bash, and more)
+
+By default, `ChatClaudeCode` runs with `max_turns=1` — pure text completion, no tool execution. Increase `max_turns` to unlock Claude Code's built-in tools:
+
+```python
+from langchain_claude_code import ChatClaudeCode
+
+# Full agent with filesystem + bash access
+agent = ChatClaudeCode(
+    model="claude-sonnet-4-20250514",
+    max_turns=10,
+    permission_mode="bypassPermissions",
+    cwd="/path/to/project",
+)
+response = agent.invoke("Read main.py, find the bug, and fix it")
+```
+
+#### Available Built-in Tools
+
+When `max_turns > 1`, Claude Code can use its built-in tools:
+
+| Tool | Description |
+|---|---|
+| `Read` | Read file contents |
+| `Write` | Create or overwrite files |
+| `Edit` | Make precise edits to files |
+| `Bash` | Run shell commands |
+| `Glob` | Find files by pattern |
+| `Grep` | Search file contents |
+| `LS` | List directory contents |
+
+#### Controlling Tool Access
+
+```python
+# Read-only agent (safe for untrusted prompts)
+reader = ChatClaudeCode(
+    model="claude-sonnet-4-20250514",
+    max_turns=5,
+    allowed_tools=["Read", "Glob", "Grep", "LS"],
+)
+
+# Everything except shell access
+no_bash = ChatClaudeCode(
+    model="claude-sonnet-4-20250514",
+    max_turns=5,
+    disallowed_tools=["Bash"],
+    permission_mode="bypassPermissions",
+)
+```
+
+#### Permission Modes
+
+| Mode | Description |
+|---|---|
+| `default` | Prompts user for permission (interactive only) |
+| `acceptEdits` | Auto-accept file edits, prompt for bash |
+| `plan` | Read-only, no writes or bash |
+| `bypassPermissions` | Auto-accept everything ⚠️ |
+
+> **⚠️ Security Note:** With `max_turns > 1` and `bypassPermissions`, the model has full access to the filesystem and can execute arbitrary shell commands in `cwd`. Only use with trusted prompts. Use `allowed_tools` or `plan` mode to restrict access.
+
 ### LangGraph ReAct Agent
 
 ```python
@@ -251,9 +316,11 @@ See [`examples/agent.py`](examples/agent.py) for a full working example.
 |---|---|---|---|
 | `system_prompt` | `str` | `None` | System prompt override |
 | `permission_mode` | `str` | `None` | `default`, `acceptEdits`, `plan`, `bypassPermissions` |
-| `max_turns` | `int` | `1` | Max conversation turns |
-| `cwd` | `str` | `None` | Working directory for CLI |
+| `max_turns` | `int` | `1` | Max conversation turns. `1` = text-only, `>1` = agentic |
+| `cwd` | `str` | `None` | Working directory for CLI and file operations |
 | `cli_path` | `str` | `None` | Path to claude binary |
+| `allowed_tools` | `list[str]` | `None` | Whitelist of tools (e.g. `["Read", "Glob"]`) |
+| `disallowed_tools` | `list[str]` | `None` | Blacklist of tools (e.g. `["Bash", "Write"]`) |
 
 ## How It Works
 

@@ -185,6 +185,7 @@ class ChatClaudeCode(BaseChatModel):
       - Effort levels (low/medium/high)
       - Streaming (real token-by-token)
       - stop_sequences
+      - Agentic mode (filesystem, bash, etc. via Claude Code's built-in tools)
 
     Requirements:
       - ``claude`` CLI installed & authenticated
@@ -195,9 +196,26 @@ class ChatClaudeCode(BaseChatModel):
 
             from langchain_claude_code import ChatClaudeCode
 
-            # Basic
+            # Basic (safe text-only, no tool execution)
             llm = ChatClaudeCode(model="claude-sonnet-4-20250514")
             llm.invoke("Hello!")
+
+            # Agentic mode (filesystem + bash access)
+            agent = ChatClaudeCode(
+                model="claude-sonnet-4-20250514",
+                max_turns=10,
+                permission_mode="bypassPermissions",
+                cwd="/path/to/project",
+            )
+            agent.invoke("Read main.py and fix the bug on line 42")
+
+            # Controlled agentic mode (read-only)
+            reader = ChatClaudeCode(
+                model="claude-sonnet-4-20250514",
+                max_turns=5,
+                allowed_tools=["Read", "Glob", "Grep"],
+            )
+            reader.invoke("Find all TODO comments in this project")
 
             # Extended thinking
             llm = ChatClaudeCode(
@@ -205,10 +223,7 @@ class ChatClaudeCode(BaseChatModel):
                 thinking={"type": "enabled", "budget_tokens": 5000},
             )
 
-            # Effort level
-            llm = ChatClaudeCode(model="claude-sonnet-4-20250514", effort="high")
-
-            # Tool calling
+            # Tool calling via bind_tools
             from langchain_core.tools import tool
 
             @tool
@@ -262,10 +277,20 @@ class ChatClaudeCode(BaseChatModel):
     """Path to claude CLI binary."""
 
     max_turns: Optional[int] = None
-    """Maximum conversation turns. Defaults to 1."""
+    """Maximum conversation turns. Defaults to 1 (text-only, no tool execution).
+    Set higher (e.g. 5-10) to enable agentic mode where Claude Code can use
+    its built-in tools (Read, Write, Edit, Bash, Glob, Grep, etc.)."""
 
     cwd: Optional[str] = None
-    """Working directory for the CLI."""
+    """Working directory for the CLI. Controls where file operations happen."""
+
+    allowed_tools: Optional[List[str]] = None
+    """Whitelist of Claude Code tools the agent can use. E.g. ["Read", "Glob", "Grep"]
+    for read-only access. When None, all tools are available (if max_turns > 1)."""
+
+    disallowed_tools: Optional[List[str]] = None
+    """Blacklist of Claude Code tools. E.g. ["Bash", "Write"] to prevent
+    shell access and file writes while allowing other tools."""
 
     # ── Internal state ───────────────────────────────────────
 
@@ -285,6 +310,8 @@ class ChatClaudeCode(BaseChatModel):
             "temperature": self.temperature,
             "effort": self.effort,
             "thinking": self.thinking,
+            "max_turns": self.max_turns,
+            "permission_mode": self.permission_mode,
         }
 
     # ── Tool binding (ChatAnthropic-compatible) ──────────────
@@ -314,7 +341,7 @@ class ChatClaudeCode(BaseChatModel):
 
     # ── Build SDK options ────────────────────────────────────
 
-    def _build_options(self) -> Any:
+    def _build_options(self, *, partial_messages: bool = False) -> Any:
         """Build ClaudeCodeOptions from model params."""
         from claude_code_sdk import ClaudeCodeOptions
 
@@ -327,7 +354,7 @@ class ChatClaudeCode(BaseChatModel):
             model=self.model,
             system_prompt=self.system_prompt,
             max_turns=self.max_turns or 1,
-            include_partial_messages=False,
+            include_partial_messages=partial_messages,
             extra_args=extra_args,
         )
 
@@ -337,29 +364,11 @@ class ChatClaudeCode(BaseChatModel):
         if self.cwd:
             options.cwd = self.cwd
 
-        return options
+        if self.allowed_tools:
+            options.allowed_tools = self.allowed_tools
 
-    def _build_streaming_options(self) -> Any:
-        """Build options with partial messages enabled for streaming."""
-        from claude_code_sdk import ClaudeCodeOptions
-
-        extra_args: dict[str, str | None] = {}
-        if self.effort:
-            extra_args["effort"] = self.effort
-
-        options = ClaudeCodeOptions(
-            model=self.model,
-            system_prompt=self.system_prompt,
-            max_turns=self.max_turns or 1,
-            include_partial_messages=True,
-            extra_args=extra_args,
-        )
-
-        if self.permission_mode:
-            options.permission_mode = self.permission_mode  # type: ignore
-
-        if self.cwd:
-            options.cwd = self.cwd
+        if self.disallowed_tools:
+            options.disallowed_tools = self.disallowed_tools
 
         return options
 
@@ -371,7 +380,7 @@ class ChatClaudeCode(BaseChatModel):
         Returns (prompt_arg, options, is_streaming_input).
         """
         system, api_messages, has_multimodal = _convert_messages(messages)
-        options = self._build_options()
+        options = self._build_options(partial_messages=False)
 
         if system:
             options.system_prompt = system
@@ -495,7 +504,7 @@ class ChatClaudeCode(BaseChatModel):
             )
 
         system, api_messages, has_multimodal = _convert_messages(messages)
-        options = self._build_streaming_options()
+        options = self._build_options(partial_messages=True)
 
         if system:
             options.system_prompt = system
