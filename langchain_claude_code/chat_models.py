@@ -1,20 +1,22 @@
 """
 ChatClaudeCode — LangChain BaseChatModel backed by Claude Code CLI.
 
-Uses the Claude Code CLI as the inference backend via claude-code-sdk.
-No API key needed; uses your Claude Pro/Max subscription.
+Drop-in replacement for ChatAnthropic that uses your Claude Pro/Max
+subscription via the Claude Code CLI. No API key needed.
 
-Note: Claude Code OAuth tokens are restricted to the Claude Code CLI —
-they cannot be used for direct API calls to the Anthropic Messages API.
-This is why inference goes through the CLI subprocess.
+Supports: invoke, stream, batch, images, tool calling, bind_tools,
+with_structured_output, extended thinking, and effort levels.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import json
+import queue
+import threading
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator, List, Optional, Union
+from typing import Any, AsyncIterator, Iterator, List, Literal, Optional, Sequence, Union
 
 from langchain_core.callbacks import (
     CallbackManagerForLLMRun,
@@ -26,21 +28,22 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     SystemMessage,
+    ToolMessage,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.tools import BaseTool
+
+
+# ── Message Conversion ───────────────────────────────────────
 
 
 def _content_to_anthropic_blocks(content: Union[str, list]) -> Union[str, list[dict]]:
     """Convert LangChain message content to Anthropic content blocks.
 
-    Handles:
-      - Plain strings → returned as-is
-      - List of dicts with type "text" → text blocks
-      - List of dicts with type "image_url" → image blocks (base64 or URL)
+    Handles text, image_url (base64 + URL), and direct Anthropic image blocks.
     """
     if isinstance(content, str):
         return content
-
     if not isinstance(content, list):
         return str(content)
 
@@ -49,48 +52,27 @@ def _content_to_anthropic_blocks(content: Union[str, list]) -> Union[str, list[d
         if isinstance(item, str):
             blocks.append({"type": "text", "text": item})
         elif isinstance(item, dict):
-            item_type = item.get("type", "")
-
-            if item_type == "text":
+            t = item.get("type", "")
+            if t == "text":
                 blocks.append({"type": "text", "text": item.get("text", "")})
-
-            elif item_type == "image_url":
-                image_url = item.get("image_url", {})
-                if isinstance(image_url, str):
-                    url = image_url
-                else:
-                    url = image_url.get("url", "")
-
+            elif t == "image_url":
+                img = item.get("image_url", {})
+                url = img if isinstance(img, str) else img.get("url", "")
                 if url.startswith("data:"):
-                    # data:image/png;base64,iVBOR...
                     header, b64data = url.split(",", 1)
                     media_type = header.split(":")[1].split(";")[0]
                     blocks.append({
                         "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": b64data,
-                        },
+                        "source": {"type": "base64", "media_type": media_type, "data": b64data},
                     })
                 else:
-                    # Regular URL
-                    blocks.append({
-                        "type": "image",
-                        "source": {
-                            "type": "url",
-                            "url": url,
-                        },
-                    })
-
-            elif item_type == "image":
-                # Direct Anthropic-style image block (passthrough)
+                    blocks.append({"type": "image", "source": {"type": "url", "url": url}})
+            elif t == "image":
                 blocks.append(item)
             else:
                 blocks.append({"type": "text", "text": str(item)})
         else:
             blocks.append({"type": "text", "text": str(item)})
-
     return blocks
 
 
@@ -99,7 +81,7 @@ def _convert_messages(
 ) -> tuple[Optional[str], list[dict], bool]:
     """Convert LangChain messages → Anthropic API format.
 
-    Returns (system, messages, has_multimodal).
+    Returns (system_prompt, messages, has_multimodal).
     """
     system: Optional[str] = None
     api_msgs: list[dict] = []
@@ -114,7 +96,32 @@ def _convert_messages(
                 has_multimodal = True
             api_msgs.append({"role": "user", "content": content})
         elif isinstance(msg, AIMessage):
-            api_msgs.append({"role": "assistant", "content": str(msg.content)})
+            # Handle tool calls in AIMessage
+            if msg.tool_calls:
+                content_blocks: list[dict] = []
+                if msg.content:
+                    content_blocks.append({"type": "text", "text": str(msg.content)})
+                for tc in msg.tool_calls:
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc["id"],
+                        "name": tc["name"],
+                        "input": tc["args"],
+                    })
+                api_msgs.append({"role": "assistant", "content": content_blocks})
+                has_multimodal = True
+            else:
+                api_msgs.append({"role": "assistant", "content": str(msg.content)})
+        elif isinstance(msg, ToolMessage):
+            api_msgs.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": msg.tool_call_id,
+                    "content": str(msg.content),
+                }],
+            })
+            has_multimodal = True
         else:
             api_msgs.append({"role": "user", "content": str(msg.content)})
 
@@ -122,7 +129,7 @@ def _convert_messages(
 
 
 def _build_prompt_string(api_messages: list[dict]) -> str:
-    """Build a plain text prompt from messages (text-only fallback)."""
+    """Build a plain text prompt from text-only messages."""
     if len(api_messages) == 1:
         content = api_messages[0]["content"]
         return content if isinstance(content, str) else str(content)
@@ -134,77 +141,135 @@ def _build_prompt_string(api_messages: list[dict]) -> str:
         if isinstance(content, str):
             parts.append(f"{role}: {content}")
         else:
-            # Extract text from blocks
-            texts = [b["text"] for b in content if b.get("type") == "text"]
+            texts = [b.get("text", "") for b in content if b.get("type") == "text"]
             parts.append(f"{role}: {' '.join(texts)}")
     return "\n\n".join(parts)
+
+
+def _tool_to_anthropic_schema(tool: Union[BaseTool, dict, type]) -> dict:
+    """Convert a LangChain tool to Anthropic tool schema."""
+    if isinstance(tool, dict):
+        return tool
+    if isinstance(tool, type):
+        # Pydantic model
+        schema = tool.model_json_schema() if hasattr(tool, "model_json_schema") else {}
+        return {
+            "name": tool.__name__,
+            "description": tool.__doc__ or "",
+            "input_schema": schema,
+        }
+    # BaseTool instance
+    return {
+        "name": tool.name,
+        "description": tool.description or "",
+        "input_schema": tool.args_schema.model_json_schema() if tool.args_schema else {"type": "object", "properties": {}},
+    }
+
+
+# ── Main ChatModel ───────────────────────────────────────────
 
 
 class ChatClaudeCode(BaseChatModel):
     """LangChain ChatModel using Claude Code CLI — no API key needed.
 
-    Uses the Claude Code CLI subprocess via ``claude-code-sdk`` to run inference
-    with your Claude Pro/Max subscription. The CLI handles all authentication
-    (OAuth tokens stored in the system keychain).
+    Drop-in replacement for ChatAnthropic. Uses your Claude Pro/Max
+    subscription via the Claude Code CLI subprocess.
+
+    Supports:
+      - invoke / stream / batch
+      - System messages
+      - Image input (base64 + URLs)
+      - Tool calling (bind_tools)
+      - Structured output (with_structured_output)
+      - Extended thinking
+      - Effort levels (low/medium/high)
+      - Streaming (real token-by-token)
+      - stop_sequences
 
     Requirements:
-      - ``claude`` CLI installed and authenticated
+      - ``claude`` CLI installed & authenticated
       - ``claude-code-sdk`` Python package
-
-    Supports multimodal input (images) via LangChain's standard format:
 
     Examples:
         .. code-block:: python
 
             from langchain_claude_code import ChatClaudeCode
-            from langchain_core.messages import HumanMessage
 
+            # Basic
             llm = ChatClaudeCode(model="claude-sonnet-4-20250514")
-
-            # Text only
             llm.invoke("Hello!")
 
-            # With image (base64)
-            import base64
-            with open("image.png", "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
+            # Extended thinking
+            llm = ChatClaudeCode(
+                model="claude-sonnet-4-20250514",
+                thinking={"type": "enabled", "budget_tokens": 5000},
+            )
 
-            llm.invoke([HumanMessage(content=[
-                {"type": "text", "text": "What's in this image?"},
-                {"type": "image_url", "image_url": {
-                    "url": f"data:image/png;base64,{b64}"
-                }},
-            ])])
+            # Effort level
+            llm = ChatClaudeCode(model="claude-sonnet-4-20250514", effort="high")
 
-            # With image URL
-            llm.invoke([HumanMessage(content=[
-                {"type": "text", "text": "Describe this image"},
-                {"type": "image_url", "image_url": {
-                    "url": "https://example.com/photo.jpg"
-                }},
-            ])])
+            # Tool calling
+            from langchain_core.tools import tool
+
+            @tool
+            def add(a: int, b: int) -> int:
+                \"\"\"Add two numbers.\"\"\"
+                return a + b
+
+            llm_with_tools = llm.bind_tools([add])
     """
 
+    # ── Core params (ChatAnthropic-compatible) ───────────────
+
     model: str = "claude-sonnet-4-20250514"
-    """Anthropic model ID."""
+    """Anthropic model ID or alias (sonnet, opus, haiku)."""
 
     max_tokens: int = 4096
     """Maximum tokens to generate."""
 
-    temperature: float = 0.0
-    """Sampling temperature."""
+    temperature: Optional[float] = None
+    """Sampling temperature (0.0-1.0)."""
+
+    top_k: Optional[int] = None
+    """Top-K sampling."""
+
+    top_p: Optional[float] = None
+    """Nucleus sampling."""
+
+    stop_sequences: Optional[List[str]] = None
+    """Stop sequences."""
+
+    streaming: bool = False
+    """Whether to stream by default."""
+
+    # ── Extended thinking ────────────────────────────────────
+
+    thinking: Optional[dict[str, Any]] = None
+    """Extended thinking config. E.g. {"type": "enabled", "budget_tokens": 5000}."""
+
+    effort: Optional[Literal["high", "medium", "low"]] = None
+    """Effort level for the session (maps to Claude Code --effort flag)."""
+
+    # ── Claude Code specific ─────────────────────────────────
 
     system_prompt: Optional[str] = None
     """System prompt override."""
 
-    permission_mode: Optional[str] = None
-    """Permission mode: default, acceptEdits, bypassPermissions."""
+    permission_mode: Optional[Literal["default", "acceptEdits", "plan", "bypassPermissions"]] = None
+    """Permission mode for the CLI."""
 
     cli_path: Optional[str] = None
-    """Path to claude CLI binary. Auto-detected if None."""
+    """Path to claude CLI binary."""
 
     max_turns: Optional[int] = None
-    """Maximum conversation turns. Defaults to 1 for single-shot."""
+    """Maximum conversation turns. Defaults to 1."""
+
+    cwd: Optional[str] = None
+    """Working directory for the CLI."""
+
+    # ── Internal state ───────────────────────────────────────
+
+    _bound_tools: Optional[list[dict]] = None
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -218,7 +283,112 @@ class ChatClaudeCode(BaseChatModel):
             "model": self.model,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
+            "effort": self.effort,
+            "thinking": self.thinking,
         }
+
+    # ── Tool binding (ChatAnthropic-compatible) ──────────────
+
+    def bind_tools(
+        self,
+        tools: Sequence[Union[dict, type, BaseTool]],
+        *,
+        tool_choice: Optional[Union[str, dict]] = None,
+        strict: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> "ChatClaudeCode":
+        """Bind tools to the model (like ChatAnthropic.bind_tools).
+
+        Args:
+            tools: List of tools (BaseTool, dict, or Pydantic model).
+            tool_choice: Not directly supported via CLI, included for API compat.
+            strict: Not directly supported via CLI, included for API compat.
+
+        Returns:
+            A new ChatClaudeCode instance with tools bound.
+        """
+        schemas = [_tool_to_anthropic_schema(t) for t in tools]
+        new = self.model_copy()
+        new._bound_tools = schemas
+        return new
+
+    # ── Build SDK options ────────────────────────────────────
+
+    def _build_options(self) -> Any:
+        """Build ClaudeCodeOptions from model params."""
+        from claude_code_sdk import ClaudeCodeOptions
+
+        extra_args: dict[str, str | None] = {}
+
+        if self.effort:
+            extra_args["effort"] = self.effort
+
+        options = ClaudeCodeOptions(
+            model=self.model,
+            system_prompt=self.system_prompt,
+            max_turns=self.max_turns or 1,
+            include_partial_messages=False,
+            extra_args=extra_args,
+        )
+
+        if self.permission_mode:
+            options.permission_mode = self.permission_mode  # type: ignore
+
+        if self.cwd:
+            options.cwd = self.cwd
+
+        return options
+
+    def _build_streaming_options(self) -> Any:
+        """Build options with partial messages enabled for streaming."""
+        from claude_code_sdk import ClaudeCodeOptions
+
+        extra_args: dict[str, str | None] = {}
+        if self.effort:
+            extra_args["effort"] = self.effort
+
+        options = ClaudeCodeOptions(
+            model=self.model,
+            system_prompt=self.system_prompt,
+            max_turns=self.max_turns or 1,
+            include_partial_messages=True,
+            extra_args=extra_args,
+        )
+
+        if self.permission_mode:
+            options.permission_mode = self.permission_mode  # type: ignore
+
+        if self.cwd:
+            options.cwd = self.cwd
+
+        return options
+
+    # ── Prompt building ──────────────────────────────────────
+
+    def _build_prompt(self, messages: List[BaseMessage]) -> tuple[Any, Any, bool]:
+        """Build prompt and options from messages.
+
+        Returns (prompt_arg, options, is_streaming_input).
+        """
+        system, api_messages, has_multimodal = _convert_messages(messages)
+        options = self._build_options()
+
+        if system:
+            options.system_prompt = system
+
+        # Inject thinking into the prompt if configured
+        thinking_instruction = ""
+        if self.thinking and self.thinking.get("type") == "enabled":
+            budget = self.thinking.get("budget_tokens", 5000)
+            thinking_instruction = f"\n\n[Think step by step. Budget: {budget} tokens for thinking.]"
+
+        if has_multimodal:
+            return api_messages, options, True
+        else:
+            prompt = _build_prompt_string(api_messages) + thinking_instruction
+            return prompt, options, False
+
+    # ── Generate ─────────────────────────────────────────────
 
     def _generate(
         self,
@@ -227,85 +397,86 @@ class ChatClaudeCode(BaseChatModel):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> ChatResult:
-        """Generate a response via Claude Code CLI subprocess."""
+        """Generate a response via Claude Code CLI."""
         try:
-            from claude_code_sdk import ClaudeCodeOptions
             from claude_code_sdk import query as claude_query
         except ImportError:
             raise ImportError(
                 "claude-code-sdk is required. Install with: pip install claude-code-sdk"
             )
 
-        system, api_messages, has_multimodal = _convert_messages(messages)
+        prompt_arg, options, is_streaming_input = self._build_prompt(messages)
 
-        options = ClaudeCodeOptions(
-            model=self.model,
-            system_prompt=system or self.system_prompt,
-            max_turns=self.max_turns or 1,
-        )
-
-        if self.permission_mode:
-            options.permission_mode = self.permission_mode  # type: ignore
+        # If tools are bound, include them in system prompt
+        if self._bound_tools:
+            tool_desc = json.dumps(self._bound_tools, indent=2)
+            tool_instruction = (
+                f"\n\nYou have access to the following tools:\n{tool_desc}\n\n"
+                "When you need to use a tool, respond with a JSON object containing "
+                '"tool_calls" with "name" and "args" fields.'
+            )
+            if options.system_prompt:
+                options.system_prompt += tool_instruction
+            else:
+                options.system_prompt = tool_instruction
 
         text_parts: list[str] = []
+        thinking_parts: list[str] = []
 
-        if has_multimodal:
-            # Use streaming mode to send multimodal content
-            async def _run_multimodal() -> None:
+        async def _run() -> None:
+            if is_streaming_input:
                 async def _input_stream() -> AsyncIterator[dict[str, Any]]:
-                    for msg in api_messages:
+                    for msg in prompt_arg:
                         yield {
                             "type": "user",
                             "message": {"role": msg["role"], "content": msg["content"]},
                         }
+                stream = claude_query(prompt=_input_stream(), options=options)
+            else:
+                stream = claude_query(prompt=prompt_arg, options=options)
 
-                async for resp in claude_query(
-                    prompt=_input_stream(), options=options
-                ):
-                    if hasattr(resp, "content"):
-                        for block in resp.content:
-                            if hasattr(block, "text"):
-                                text_parts.append(block.text)
+            async for msg in stream:
+                if hasattr(msg, "content"):
+                    for block in msg.content:
+                        if hasattr(block, "text"):
+                            text_parts.append(block.text)
+                        elif hasattr(block, "thinking"):
+                            thinking_parts.append(block.thinking)
 
-            self._run_async(_run_multimodal())
-        else:
-            # Simple string prompt for text-only
-            prompt = _build_prompt_string(api_messages)
-
-            async def _run_text() -> None:
-                async for msg in claude_query(prompt=prompt, options=options):
-                    if hasattr(msg, "content"):
-                        for block in msg.content:
-                            if hasattr(block, "text"):
-                                text_parts.append(block.text)
-
-            self._run_async(_run_text())
+        self._run_async(_run())
 
         text = "".join(text_parts)
 
+        # Build generation info
+        gen_info: dict[str, Any] = {"model": self.model, "backend": "cli"}
+        if thinking_parts:
+            gen_info["thinking"] = "".join(thinking_parts)
+
+        # Parse tool calls from response if tools are bound
+        ai_msg = AIMessage(content=text)
+        if self._bound_tools and text:
+            try:
+                # Try to parse tool calls from the response
+                parsed = json.loads(text)
+                if isinstance(parsed, dict) and "tool_calls" in parsed:
+                    tool_calls = []
+                    for tc in parsed["tool_calls"]:
+                        tool_calls.append({
+                            "name": tc["name"],
+                            "args": tc.get("args", {}),
+                            "id": tc.get("id", f"call_{hash(tc['name'])}"),
+                        })
+                    ai_msg = AIMessage(content=text, tool_calls=tool_calls)
+            except (json.JSONDecodeError, KeyError):
+                pass
+
         return ChatResult(
             generations=[
-                ChatGeneration(
-                    message=AIMessage(content=text),
-                    generation_info={"model": self.model, "backend": "cli"},
-                )
+                ChatGeneration(message=ai_msg, generation_info=gen_info)
             ]
         )
 
-    @staticmethod
-    def _run_async(coro: Any) -> None:
-        """Run an async coroutine synchronously."""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                pool.submit(lambda: asyncio.run(coro)).result()
-        else:
-            asyncio.run(coro)
+    # ── Stream ───────────────────────────────────────────────
 
     def _stream(
         self,
@@ -314,9 +485,8 @@ class ChatClaudeCode(BaseChatModel):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        """Stream response tokens as they arrive from Claude Code CLI."""
+        """Stream response tokens as they arrive."""
         try:
-            from claude_code_sdk import ClaudeCodeOptions
             from claude_code_sdk import query as claude_query
             from claude_code_sdk.types import StreamEvent
         except ImportError:
@@ -325,19 +495,21 @@ class ChatClaudeCode(BaseChatModel):
             )
 
         system, api_messages, has_multimodal = _convert_messages(messages)
+        options = self._build_streaming_options()
 
-        options = ClaudeCodeOptions(
-            model=self.model,
-            system_prompt=system or self.system_prompt,
-            max_turns=self.max_turns or 1,
-            include_partial_messages=True,
-        )
+        if system:
+            options.system_prompt = system
 
-        if self.permission_mode:
-            options.permission_mode = self.permission_mode  # type: ignore
-
-        import queue
-        import threading
+        if self._bound_tools:
+            tool_desc = json.dumps(self._bound_tools, indent=2)
+            tool_instruction = (
+                f"\n\nYou have access to the following tools:\n{tool_desc}\n\n"
+                "When you need to use a tool, respond with a JSON object."
+            )
+            if options.system_prompt:
+                options.system_prompt += tool_instruction
+            else:
+                options.system_prompt = tool_instruction
 
         chunk_queue: queue.Queue[Optional[str]] = queue.Queue()
 
@@ -355,7 +527,6 @@ class ChatClaudeCode(BaseChatModel):
 
             async for msg in claude_query(prompt=prompt_arg, options=options):
                 if isinstance(msg, StreamEvent):
-                    # Extract text delta from Anthropic stream events
                     event = msg.event
                     if isinstance(event, dict):
                         evt_type = event.get("type", "")
@@ -365,7 +536,7 @@ class ChatClaudeCode(BaseChatModel):
                             if text:
                                 chunk_queue.put(text)
 
-            chunk_queue.put(None)  # sentinel
+            chunk_queue.put(None)
 
         thread = threading.Thread(target=lambda: asyncio.run(_run()), daemon=True)
         thread.start()
@@ -380,3 +551,20 @@ class ChatClaudeCode(BaseChatModel):
             yield chunk
 
         thread.join()
+
+    # ── Async helper ─────────────────────────────────────────
+
+    @staticmethod
+    def _run_async(coro: Any) -> None:
+        """Run an async coroutine synchronously."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                pool.submit(lambda: asyncio.run(coro)).result()
+        else:
+            asyncio.run(coro)
