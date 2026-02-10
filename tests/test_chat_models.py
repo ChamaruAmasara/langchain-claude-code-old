@@ -1,7 +1,5 @@
 """Unit tests for ChatClaudeCode."""
 
-from unittest.mock import MagicMock, patch
-
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from langchain_claude_code.chat_models import ChatClaudeCode, _convert_messages
@@ -39,25 +37,3 @@ def test_identifying_params():
     params = llm._identifying_params
     assert params["model"] == "claude-opus-4-20250514"
     assert params["temperature"] == 0.5
-    assert params["backend"] == "api"
-
-
-@patch("langchain_claude_code.chat_models.httpx.post")
-def test_api_generate(mock_post):
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {
-        "content": [{"type": "text", "text": "Hello!"}],
-        "model": "claude-sonnet-4-20250514",
-        "usage": {"input_tokens": 10, "output_tokens": 5},
-        "stop_reason": "end_turn",
-    }
-    mock_post.return_value = mock_resp
-
-    llm = ChatClaudeCode()
-    llm.oauth_manager = MagicMock()
-    llm.oauth_manager.get_access_token.return_value = "fake-token"
-
-    result = llm.invoke([HumanMessage(content="Hi")])
-    assert result.content == "Hello!"
-    mock_post.assert_called_once()

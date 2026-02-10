@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "langchain-claude-code"
 version = "0.1.0"
-description = "LangChain integration for Claude Code - use your Claude Pro/Max subscription as a LangChain ChatModel"
+description = "LangChain ChatModel using Claude Code CLI - use your Claude Pro/Max subscription, no API key needed"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
     { name = "Chamaru Amasara", email = "chamaru@donely.ai" },
 ]
-keywords = ["langchain", "claude", "anthropic", "oauth", "claude-code"]
+keywords = ["langchain", "claude", "anthropic", "claude-code"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -27,17 +27,13 @@ classifiers = [
 
 dependencies = [
     "langchain-core>=0.3.0",
-    "httpx>=0.25.0",
+    "claude-code-sdk>=0.0.20",
 ]
 
 [project.optional-dependencies]
-cli = ["claude-code-sdk>=0.0.20"]
-all = ["claude-code-sdk>=0.0.20"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "langchain-core>=0.3.0",
-    "claude-code-sdk>=0.0.20",
 ]
 
 [project.urls]
