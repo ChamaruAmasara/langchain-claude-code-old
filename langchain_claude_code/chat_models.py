@@ -314,7 +314,69 @@ class ChatClaudeCode(BaseChatModel):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        """Stream — currently falls back to full generate."""
-        result = self._generate(messages, stop, run_manager, **kwargs)
-        text = result.generations[0].message.content
-        yield ChatGenerationChunk(message=AIMessageChunk(content=str(text)))
+        """Stream response tokens as they arrive from Claude Code CLI."""
+        try:
+            from claude_code_sdk import ClaudeCodeOptions
+            from claude_code_sdk import query as claude_query
+            from claude_code_sdk.types import StreamEvent
+        except ImportError:
+            raise ImportError(
+                "claude-code-sdk is required. Install with: pip install claude-code-sdk"
+            )
+
+        system, api_messages, has_multimodal = _convert_messages(messages)
+
+        options = ClaudeCodeOptions(
+            model=self.model,
+            system_prompt=system or self.system_prompt,
+            max_turns=self.max_turns or 1,
+            include_partial_messages=True,
+        )
+
+        if self.permission_mode:
+            options.permission_mode = self.permission_mode  # type: ignore
+
+        import queue
+        import threading
+
+        chunk_queue: queue.Queue[Optional[str]] = queue.Queue()
+
+        async def _run() -> None:
+            if has_multimodal:
+                async def _input_stream() -> AsyncIterator[dict[str, Any]]:
+                    for msg in api_messages:
+                        yield {
+                            "type": "user",
+                            "message": {"role": msg["role"], "content": msg["content"]},
+                        }
+                prompt_arg: Any = _input_stream()
+            else:
+                prompt_arg = _build_prompt_string(api_messages)
+
+            async for msg in claude_query(prompt=prompt_arg, options=options):
+                if isinstance(msg, StreamEvent):
+                    # Extract text delta from Anthropic stream events
+                    event = msg.event
+                    if isinstance(event, dict):
+                        evt_type = event.get("type", "")
+                        if evt_type == "content_block_delta":
+                            delta = event.get("delta", {})
+                            text = delta.get("text", "")
+                            if text:
+                                chunk_queue.put(text)
+
+            chunk_queue.put(None)  # sentinel
+
+        thread = threading.Thread(target=lambda: asyncio.run(_run()), daemon=True)
+        thread.start()
+
+        while True:
+            text = chunk_queue.get()
+            if text is None:
+                break
+            chunk = ChatGenerationChunk(message=AIMessageChunk(content=text))
+            if run_manager:
+                run_manager.on_llm_new_token(text)
+            yield chunk
+
+        thread.join()
